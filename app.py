@@ -1,75 +1,97 @@
-from flask import Flask, request, jsonify
 import os
+from flask import Flask, request, jsonify
 
-# If you want to actually hit Twilio:
-from twilio.rest import Client
+# Twilio is optional at runtime; we'll only use it if creds exist
+try:
+    from twilio.rest import Client  # type: ignore
+except Exception:
+    Client = None  # library not strictly required for mock mode
 
 app = Flask(__name__)
 
+# --- Config / Env ---
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "").strip()
+
+# If any Twilio secret is missing, we operate in mock mode (safe for A2P-unapproved phase)
+TWILIO_READY = all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_MESSAGING_SERVICE_SID])
+
+twilio_client = None
+if TWILIO_READY and Client is not None:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# --- Routes ---
+
 @app.route("/", methods=["GET"])
-def index():
-    return "Home Health Assistant API (Cloud) ✅", 200
+def root():
+    return "Home Health Assistant API (Cloud) ✅"
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    """
+    Lightweight health check for Render / uptime monitors.
+    """
+    return jsonify(
+        status="ok",
+        service="Home Health Assistant",
+        twilio_ready=bool(TWILIO_READY),
+        mode="live" if TWILIO_READY else "mock"
+    ), 200
 
 @app.route("/send-sms", methods=["POST"])
 def send_sms():
-    data = request.get_json(force=True)
+    """
+    Body:
+    {
+      "to": "+1XXXXXXXXXX",
+      "body": "Message text"
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    to = (data.get("to") or "").strip()
+    body = (data.get("body") or "").strip()
 
-    to_number = data.get("to")
-    body = data.get("body", "")
+    if not to or not body:
+        return jsonify(error="Both 'to' and 'body' are required."), 400
 
-    if not to_number:
-        return jsonify({"error": "Missing 'to'"}), 400
+    # Mock mode (safe while A2P/10DLC campaign is pending)
+    if not TWILIO_READY or twilio_client is None:
+        return jsonify(
+            status="mocked",
+            to=to,
+            body=body,
+            note="Twilio not active; returning simulated success."
+        ), 200
 
-    # decide if we really call Twilio or just mock
-    twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
-    messaging_service_sid = os.getenv("TWILIO_MESSAGING_SERVICE_SID")
-
-    # if any of these is missing, just mock it
-    if not (twilio_sid and twilio_token and messaging_service_sid):
-        return jsonify({
-            "status": "mocked",
-            "to": to_number,
-            "body": body
-        }), 200
-
-    client = Client(twilio_sid, twilio_token)
-
+    # Live mode via Messaging Service
     try:
-        msg = client.messages.create(
-            to=to_number,
-            messaging_service_sid=messaging_service_sid,
-            body=body
+        msg = twilio_client.messages.create(
+            messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
+            to=to,
+            body=body,
         )
-        return jsonify({
-            "status": "sent-to-twilio",
-            "sid": msg.sid,
-            "to": to_number,
-            "body": body
-        }), 200
+        return jsonify(
+            status="sent",
+            sid=msg.sid,
+            to=to,
+            body=body
+        ), 200
     except Exception as e:
-        # you may still hit the 10DLC error here – that’s OK right now
-        return jsonify({
-            "status": "twilio-error",
-            "error": str(e)
-        }), 500
+        # Don’t leak secrets; return safe error
+        return jsonify(status="twilio-error", error=str(e)[:400]), 502
 
-@app.route("/sms-webhook", methods=["POST"])
-def sms_webhook():
+@app.route("/twilio-webhook", methods=["POST"])
+def twilio_webhook():
     """
-    This is the route Twilio will POST to when a patient replies.
-    For now we just log and echo back.
+    Twilio will POST inbound replies here (after you wire the webhook in the console).
+    For now we just acknowledge; later we’ll parse and route to therapists.
     """
-    from_number = request.form.get("From")
-    body = request.form.get("Body")
+    # You can inspect request.form for 'From', 'Body', etc.
+    # Example minimal OK:
+    return ("", 204)
 
-    print(f"📨 Incoming SMS from {from_number}: {body}")
-
-    # you can respond with TwiML or just 200 OK
-    return "OK", 200
-
-
+# Render/Heroku style entrypoint
+# (gunicorn uses: `gunicorn app:app`)
 if __name__ == "__main__":
-    # Render sets PORT in env. Locally it will default to 5000.
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))

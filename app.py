@@ -1,102 +1,47 @@
-import os
-import json
-import time
-import base64
-import csv
-from datetime import datetime, timezone
-from collections import deque, defaultdict
-from flask import Flask, request, jsonify, Response, abort, make_response
+import os, re, json, time, csv, io, hashlib, datetime
+from pathlib import Path
+from flask import Flask, request, jsonify, Response, make_response
 
-# -------------------------------
-# Optional Twilio client (only if creds are present)
-# -------------------------------
-Client = None
-try:
-    from twilio.rest import Client as TwilioClient  # type: ignore
-    Client = TwilioClient
-except Exception:
-    Client = None
-
+# ---------- Config ----------
+APP_NAME = "Home Health Assistant"
 app = Flask(__name__)
 
-# -------------------------------
-# Env & Config
-# -------------------------------
-FLASK_ENV = os.getenv("FLASK_ENV", "production")
-PY_VERSION = os.getenv("PYTHON_VERSION", "").strip() or "3.x"
+# Twilio (optional in mock mode)
+try:
+    from twilio.rest import Client  # noqa
+except Exception:
+    Client = None
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "").strip()
+TWILIO_READY = all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_MESSAGING_SERVICE_SID])
 
-STORE_BACKEND = os.getenv("STORE_BACKEND", "json").strip().lower()  # json | sqlite (json for now)
+DEBUG_USER = os.getenv("DEBUG_USER", "").strip()        # optional
+DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "").strip()      # set in Render
+STORE_BACKEND = (os.getenv("STORE_BACKEND") or "json").lower()  # "json" for now
 ADMIN_PAGE_SIZE = int(os.getenv("ADMIN_PAGE_SIZE", "50"))
-RATE_LIMIT_WINDOW_SEC = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
-RATE_LIMIT_MAX_SIMULATE = int(os.getenv("RATE_LIMIT_MAX_SIMULATE", "30"))
+RATE_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
+RATE_MAX_SIM = int(os.getenv("RATE_LIMIT_MAX_SIMULATE", "30"))
 
-DEBUG_USER = os.getenv("DEBUG_USER", "").strip()
-DEBUG_PASS = os.getenv("DEBUG_PASS", "").strip()  # optional, only if you want Basic Auth password
-DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "").strip()
+START_TS = time.time()
+BUILD_ID = hashlib.sha1(f"{START_TS}".encode()).hexdigest()[:16]
+REGION = os.getenv("RENDER_REGION", "local")
+GIT_COMMIT = os.getenv("RENDER_GIT_COMMIT", "")[:7] if os.getenv("RENDER_GIT_COMMIT") else ""
+VERSION = "1.0.1"
+BUILD_TIME = datetime.datetime.utcnow().isoformat()
 
-BUILD_REGION = os.getenv("RENDER_REGION", "local")
-BUILD_ID = os.getenv("RENDER_SERVICE_ID", "local")
-GIT_COMMIT = os.getenv("GIT_COMMIT", os.getenv("RENDER_GIT_COMMIT", "local"))[:7] or "local"
-VERSION = os.getenv("APP_VERSION", "1.0.0")
+# ---------- Storage (JSONL) ----------
+STORE_DIR = Path("store")
+STORE_DIR.mkdir(exist_ok=True)
+MSG_FILE = STORE_DIR / "messages.jsonl"
+RATE_FILE = STORE_DIR / "rate.json"
 
-APP_START = time.time()
-
-# -------------------------------
-# Twilio readiness
-# -------------------------------
-TWILIO_READY = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_MESSAGING_SERVICE_SID and Client)
-twilio_client = None
-if TWILIO_READY:
-    try:
-        twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)  # type: ignore
-    except Exception:
-        TWILIO_READY = False
-        twilio_client = None
-
-MODE = "live" if TWILIO_READY else "mock"
-
-# -------------------------------
-# Simple JSONL store
-# -------------------------------
-DATA_FILE = "messages.jsonl"
-
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-def jsonl_append(record: dict) -> None:
-    if STORE_BACKEND != "json":
-        return
-    rec = dict(record)
-    rec.setdefault("ts", _now_iso())
-    line = json.dumps(rec, ensure_ascii=False)
-    with open(DATA_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-def jsonl_tail(n: int):
-    """Return last n records (efficient-ish for modest files)."""
-    if not os.path.exists(DATA_FILE):
-        return []
-    dq = deque(maxlen=n)
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                dq.append(json.loads(line))
-            except Exception:
-                continue
-    return list(dq)
-
-def jsonl_all():
-    if not os.path.exists(DATA_FILE):
+def _read_all_messages():
+    if not MSG_FILE.exists():
         return []
     out = []
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
+    with MSG_FILE.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -104,377 +49,318 @@ def jsonl_all():
             try:
                 out.append(json.loads(line))
             except Exception:
-                continue
+                # keep going even if 1 bad line
+                pass
     return out
 
-# -------------------------------
-# Auth helpers for /debug and /admin/*
-# -------------------------------
-def _is_authorized(req: request) -> bool:
-    # Token in query string
-    token_qs = req.args.get("token", "")
-    if DEBUG_TOKEN and token_qs and token_qs == DEBUG_TOKEN:
-        return True
+def _append_message(rec: dict):
+    rec["ts"] = time.time()
+    with MSG_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    # Basic Auth header: "Basic base64(user:pass)"
-    auth = req.headers.get("Authorization", "")
-    if auth.startswith("Basic "):
-        try:
-            raw = base64.b64decode(auth.split(" ", 1)[1].strip()).decode("utf-8")
-            user, pwd = raw.split(":", 1)
-            if DEBUG_USER and user == DEBUG_USER:
-                # If DEBUG_PASS is set, check it. Otherwise permit any password for the known user.
-                if DEBUG_PASS:
-                    return pwd == DEBUG_PASS
-                return True
-        except Exception:
-            pass
-
-    # Token header
-    hdr_token = req.headers.get("X-Debug-Token", "")
-    if DEBUG_TOKEN and hdr_token == DEBUG_TOKEN:
-        return True
-
-    return False
-
-def require_auth():
-    if not _is_authorized(request):
-        # 401 with WWW-Authenticate prompts browser for Basic Auth
-        resp = make_response("Unauthorized", 401)
-        resp.headers["WWW-Authenticate"] = 'Basic realm="HomeHealthAssistant"'
-        return resp
-    return None
-
-# -------------------------------
-# Rate limiting (in-memory)
-# -------------------------------
-recent_hits = deque()  # timestamps of simulate/send attempts
-
-def rate_limit_guard():
+def _count_recent_simulations():
     now = time.time()
-    # drop old entries
-    while recent_hits and now - recent_hits[0] > RATE_LIMIT_WINDOW_SEC:
-        recent_hits.popleft()
-    if len(recent_hits) >= RATE_LIMIT_MAX_SIMULATE:
-        return False
-    recent_hits.append(now)
-    return True
+    start = now - RATE_WINDOW
+    count = 0
+    for m in _read_all_messages():
+        if m.get("kind") == "simulate" and m.get("ts", 0) >= start:
+            count += 1
+    return count
 
-# -------------------------------
-# Utility: classify very simple "intent" from text
-# -------------------------------
-def classify_intent(body: str) -> str:
-    b = (body or "").strip().lower()
-    if not b:
-        return "empty"
-    keys = {
-        "confirm": ["yes", "yep", "confirm", "ok", "okay", "yup", "sure"],
-        "reschedule": ["reschedule", "another time", "later", "tomorrow", "move"],
-        "cancel": ["cancel", "can't", "cannot", "no"],
-        "language": ["spanish", "portuguese", "brazil", "español", "português"],
-        "address": ["address", "where", "location"],
-    }
-    for label, words in keys.items():
-        if any(w in b for w in words):
-            return label
+# ---------- Intent detection ----------
+YES_RE = re.compile(r"\b(yes|yeah|yep|confirm|ok|okay|si|sim)\b", re.I)
+NO_RE  = re.compile(r"\b(no|nope|nao|não|cancel)\b", re.I)
+TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.I)
+
+def detect_intent(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return "other"
+    if YES_RE.search(t):
+        return "confirm"
+    if NO_RE.search(t):
+        return "decline"
+    if TIME_RE.search(t):
+        return "time"
     return "other"
 
-# -------------------------------
-# Root & health
-# -------------------------------
+# ---------- Security helpers ----------
+def _auth_ok(req) -> bool:
+    # header wins, then query string
+    token = req.headers.get("X-Debug-Token") or req.args.get("token") or ""
+    return (DEBUG_TOKEN and token == DEBUG_TOKEN)
+
+def _require_auth():
+    if not _auth_ok(request):
+        return make_response(("Unauthorized", 401, {"WWW-Authenticate": "Bearer"}))
+    return None
+
+# ---------- Health & Metrics ----------
+def uptime_seconds() -> float:
+    return round(time.time() - START_TS, 2)
+
+def service_snapshot(status="ok"):
+    return {
+        "mode": "live" if TWILIO_READY else "mock",
+        "service": APP_NAME,
+        "status": status,
+        "twilio_ready": TWILIO_READY,
+        "uptime_seconds": uptime_seconds()
+    }
+
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "Home Health Assistant", "status": "ok", "mode": MODE})
+    return jsonify({k: service_snapshot()[k] for k in ("service","status","mode")})
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    uptime = max(0.0, time.time() - APP_START)
+    return jsonify(service_snapshot())
+
+# Prometheus-style counters (very light)
+COUNTERS = {
+    "requests_total": 0,
+    "errors_total": 0,
+    "avg_latency_seconds": 0.0,
+    "sms_out_total": 0,
+}
+
+@app.before_request
+def _before():
+    request._t0 = time.time()
+    COUNTERS["requests_total"] += 1
+
+@app.after_request
+def _after(resp):
+    dt = max(0.0, time.time() - getattr(request, "_t0", time.time()))
+    # online incremental avg
+    n = max(1, COUNTERS["requests_total"])
+    COUNTERS["avg_latency_seconds"] = COUNTERS["avg_latency_seconds"] + (dt - COUNTERS["avg_latency_seconds"])/n
+    return resp
+
+@app.errorhandler(Exception)
+def _err(e):
+    COUNTERS["errors_total"] += 1
+    return (f"<h1>Internal Server Error</h1>", 500)
+
+@app.route("/metrics", methods=["GET"])
+def metrics_json():
     return jsonify({
-        "mode": MODE,
-        "service": "Home Health Assistant",
         "status": "ok",
-        "twilio_ready": TWILIO_READY,
-        "uptime_seconds": round(uptime, 2),
+        "service": APP_NAME,
+        "mode": "live" if TWILIO_READY else "mock",
+        "uptime_seconds": uptime_seconds(),
+        "healthz": COUNTERS,
+        "routes": {"/": {}, "/healthz": {}, "/metrics": {}, "/simulate-sms": {}, "/send-sms": {}},
+        "build": {
+            "build_id": BUILD_ID, "region": REGION, "git_commit": GIT_COMMIT or "local",
+            "service": APP_NAME, "version": VERSION, "build_time": BUILD_TIME
+        }
     })
-
-# -------------------------------
-# Metrics (Prometheus text exposition)
-# -------------------------------
-# These counters are in-memory (reset on dyno restart, ok for now)
-counters = defaultdict(int)
-latency_hist = deque(maxlen=500)  # store last latencies (ms) for a tiny avg
-
-def _record_metric(name: str, ms: float = None):
-    counters[name] += 1
-    if ms is not None:
-        latency_hist.append(ms)
 
 @app.route("/metrics.prom", methods=["GET"])
 def metrics_prom():
-    # Basic counters and a simple avg latency
-    avg_ms = 0.0
-    if latency_hist:
-        avg_ms = sum(latency_hist) / len(latency_hist)
+    # return only simple numeric lines (Prom format)
+    lines = [
+        f'homehealth_requests_total {COUNTERS["requests_total"]}',
+        f'homehealth_errors_total {COUNTERS["errors_total"]}',
+        f'homehealth_avg_latency_seconds {COUNTERS["avg_latency_seconds"]:.6f}',
+        f'homehealth_uptime_seconds {uptime_seconds():.2f}',
+        f'homehealth_sms_out_total {COUNTERS["sms_out_total"]}',
+    ]
+    return Response("\n".join(lines) + "\n", mimetype="text/plain")
 
-    lines = []
-    lines.append("# HELP hha_requests_total Total requests by type")
-    lines.append("# TYPE hha_requests_total counter")
-    for k, v in counters.items():
-        lines.append(f'hha_requests_total{{route="{k}"}} {v}')
-
-    lines.append("# HELP hha_avg_latency_ms Average handler latency (approx)")
-    lines.append("# TYPE hha_avg_latency_ms gauge")
-    # Emit a float safely
-    lines.append(f"hha_avg_latency_ms {avg_ms:.3f}")
-
-    # Health summary gauge
-    lines.append("# HELP hha_twilio_ready Twilio readiness (1 or 0)")
-    lines.append("# TYPE hha_twilio_ready gauge")
-    lines.append(f"hha_twilio_ready {1 if TWILIO_READY else 0}")
-
-    body = "\n".join(lines) + "\n"
-    return Response(body, mimetype="text/plain")
-
-# -------------------------------
-# Debug dashboard (token or basic auth)
-# -------------------------------
-@app.route("/debug", methods=["GET"])
-def debug_dashboard():
-    need = require_auth()
-    if need:
-        return need
-
-    uptime = max(0.0, time.time() - APP_START)
-    status = {
-        "status": "ok",
-        "service": "Home Health Assistant",
-        "mode": MODE,
-        "uptime_seconds": round(uptime, 2),
-        "twilio_ready": TWILIO_READY,
-        "region": BUILD_REGION,
-        "build_id": BUILD_ID,
-        "git_commit": GIT_COMMIT,
-        "version": VERSION,
-        "build_time": datetime.utcfromtimestamp(APP_START).replace(tzinfo=timezone.utc).isoformat(),
-        "tip": "Use /debug?token=YOUR_TOKEN or Basic Auth to access.",
-    }
-
-    # minimal HTML table for quick human view
-    rows = "\n".join(
-        f"<tr><th style='text-align:left;padding:6px 10px;'>{k.upper()}</th>"
-        f"<td style='padding:6px 10px;'>{status[k]}</td></tr>"
-        for k in [
-            "mode", "uptime_seconds", "twilio_ready", "region", "build_id",
-            "git_commit", "version", "build_time"
-        ]
-    )
-    html = f"""
-    <html><head><title>Home Health Assistant – Debug</title>
-    <style>
-      body {{ font-family: -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }}
-      h1 {{ color: #1145e6; }}
-      table {{ border-collapse: collapse; border: 1px solid #ddd; }}
-      th, td {{ border: 1px solid #ddd; }}
-    </style></head>
-    <body>
-      <h1>Home Health Assistant Debug Dashboard</h1>
-      <p>Status: <b style="color:green">ok</b></p>
-      <table>{rows}</table>
-      <p style="margin-top:12px;font-size:12px;">Tip: You can also use a query token if configured: <code>/debug?token=YOUR_TOKEN</code></p>
-    </body></html>
-    """
-    return Response(html, mimetype="text/html")
-
-# -------------------------------
-# Simulation & sending
-# -------------------------------
+# ---------- SMS simulation & send ----------
 @app.route("/simulate-sms", methods=["POST"])
 def simulate_sms():
-    start = time.time()
-    if not rate_limit_guard():
-        abort(429, description="Rate limit exceeded. Please slow down.")
+    # Rate limit for simulate
+    if _count_recent_simulations() >= RATE_MAX_SIM:
+        return jsonify({"ok": False, "error": "rate_limited", "window_sec": RATE_WINDOW}), 429
 
-    data = request.get_json(silent=True) or {}
-    from_num = (data.get("from") or data.get("from_number") or "simulated").strip()
-    body = (data.get("body") or "").strip()
+    payload = request.get_json(silent=True) or {}
+    from_num = (payload.get("from") or "").strip()
+    body = (payload.get("body") or "").strip()
 
-    intent = classify_intent(body)
-    record = {
-        "source": "simulate",
-        "direction": "inbound",
-        "from": from_num,
-        "to": "clinic",
-        "body": body,
-        "intent": intent,
-        "twilio_message_sid": None,
-        "ts": _now_iso()
-    }
-    jsonl_append(record)
-    _record_metric("simulate_sms", (time.time() - start) * 1000.0)
+    intent = detect_intent(body)
+    _append_message({"kind": "simulate", "direction": "in", "from": from_num, "body": body, "intent": intent})
 
-    return jsonify({"ok": True, "intent": intent, "echo": body})
+    # NEW: auto-confirm loopback (mock) — if confirm, log an outbound “thanks”
+    if intent == "confirm":
+        thanks = "Thanks! See you at the scheduled time."
+        _append_message({"kind": "simulate", "direction": "out", "to": from_num, "body": thanks, "note": "auto-confirm"})
+        COUNTERS["sms_out_total"] += 1
+
+    return jsonify({"ok": True, "echo": body, "intent": intent})
 
 @app.route("/send-sms", methods=["POST"])
 def send_sms():
-    start = time.time()
-    if not rate_limit_guard():
-        abort(429, description="Rate limit exceeded. Please slow down.")
+    payload = request.get_json(silent=True) or {}
+    to = (payload.get("to") or "").strip()
+    body = (payload.get("body") or "").strip()
 
-    data = request.get_json(silent=True) or {}
-    to_number = (data.get("to") or "").strip()
-    body = (data.get("body") or "").strip()
-    if not to_number or not body:
-        abort(400, description="Missing 'to' or 'body'")
+    if not to or not body:
+        return jsonify({"ok": False, "error": "missing_fields"}), 400
 
-    if TWILIO_READY and twilio_client:
-        try:
-            msg = twilio_client.messages.create(
-                messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
-                to=to_number,
-                body=body
-            )
-            sid = msg.sid
-            status = "sent-to-twilio"
-        except Exception as e:
-            sid = None
-            status = f"twilio-error: {e}"
-    else:
-        sid = "mock-" + str(int(time.time()))
-        status = "mock-sent"
+    if not TWILIO_READY or Client is None:
+        # mock success
+        sid = f"mock-{int(time.time()*1000)}"
+        _append_message({"kind": "send", "direction": "out", "to": to, "body": body, "sid": sid, "mock": True})
+        COUNTERS["sms_out_total"] += 1
+        return jsonify({"sid": sid, "status": "mock-sent"})
 
-    record = {
-        "source": "api",
-        "direction": "outbound",
-        "from": "clinic",
-        "to": to_number,
-        "body": body,
-        "intent": classify_intent(body),
-        "twilio_message_sid": sid,
-        "ts": _now_iso()
-    }
-    jsonl_append(record)
-    _record_metric("send_sms", (time.time() - start) * 1000.0)
+    # (When campaign is approved, we’ll send via Twilio client here)
+    try:
+        tw = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        msg = tw.messages.create(messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID, to=to, body=body)
+        _append_message({"kind": "send", "direction": "out", "to": to, "body": body, "sid": msg.sid, "mock": False})
+        COUNTERS["sms_out_total"] += 1
+        return jsonify({"sid": msg.sid, "status": msg.status or "sent"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    return jsonify({"status": status, "sid": sid})
-
-# -------------------------------
-# Twilio webhook placeholder
-# -------------------------------
-@app.route("/twilio/sms", methods=["POST"])
-def twilio_webhook_sms():
-    """
-    Twilio will POST here later. For now, we accept either real Twilio form
-    data or JSON (for tests). We always log the inbound message.
-    """
-    start = time.time()
-    body = request.form.get("Body") or (request.get_json(silent=True) or {}).get("body") or ""
-    from_num = request.form.get("From") or (request.get_json(silent=True) or {}).get("from") or "unknown"
-
-    record = {
-        "source": "twilio" if TWILIO_READY else "webhook-test",
-        "direction": "inbound",
-        "from": from_num,
-        "to": "clinic",
-        "body": body,
-        "intent": classify_intent(body),
-        "twilio_message_sid": request.form.get("MessageSid"),
-        "ts": _now_iso()
-    }
-    jsonl_append(record)
-    _record_metric("twilio_inbound", (time.time() - start) * 1000.0)
-
-    # TwiML minimal response (helps clear Twilio queue if used live)
-    resp = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
-    return Response(resp, mimetype="application/xml")
-
-# -------------------------------
-# Admin & analytics
-# -------------------------------
+# ---------- Admin APIs (token protected) ----------
 @app.route("/admin/messages", methods=["GET"])
 def admin_messages():
-    need = require_auth()
-    if need:
-        return need
-
-    n = int(request.args.get("limit", str(ADMIN_PAGE_SIZE)))
-    msgs = jsonl_tail(max(1, min(n, 500)))
-    return jsonify({"count": len(msgs), "messages": msgs})
+    unauth = _require_auth()
+    if unauth: return unauth
+    limit = max(1, min(int(request.args.get("limit", ADMIN_PAGE_SIZE)), 500))
+    q = (request.args.get("q") or "").lower().strip()
+    items = list(reversed(_read_all_messages()))
+    if q:
+        items = [m for m in items if q in json.dumps(m).lower()]
+    return jsonify({"count": len(items[:limit]), "items": items[:limit]})
 
 @app.route("/admin/intents", methods=["GET"])
 def admin_intents():
-    need = require_auth()
-    if need:
-        return need
-
-    msgs = jsonl_tail(1000)
-    tally = defaultdict(int)
-    for m in msgs:
-        label = m.get("intent") or classify_intent(m.get("body", ""))
-        tally[label] += 1
-
-    # sort desc
-    ranked = sorted(tally.items(), key=lambda t: t[1], reverse=True)
-    return jsonify({"intents": [{"intent": k, "count": v} for k, v in ranked]})
+    unauth = _require_auth()
+    if unauth: return unauth
+    tally = {}
+    for m in _read_all_messages():
+        if "intent" in m:
+            tally[m["intent"]] = tally.get(m["intent"], 0) + 1
+    intents = [{"intent": k, "count": v} for k, v in sorted(tally.items(), key=lambda x: -x[1])]
+    return jsonify({"intents": intents})
 
 @app.route("/admin/export.csv", methods=["GET"])
 def admin_export_csv():
-    need = require_auth()
-    if need:
-        return need
+    unauth = _require_auth()
+    if unauth: return unauth
+    rows = _read_all_messages()
+    # CSV to browser download
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=sorted({k for r in rows for k in r.keys()}))
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: r.get(k, "") for k in writer.fieldnames})
+    resp = make_response(output.getvalue())
+    resp.headers["Content-Type"] = "text/csv"
+    resp.headers["Content-Disposition"] = 'attachment; filename="export.csv"'
+    return resp
 
-    rows = jsonl_all()
-    # Prepare CSV
-    headers = ["ts", "source", "direction", "from", "to", "body", "intent", "twilio_message_sid"]
-    def gen():
-        yield ",".join(headers) + "\n"
-        w = csv.writer(None)  # type: ignore  # just for quoting help
-        for r in rows:
-            line = [
-                r.get("ts", ""),
-                r.get("source", ""),
-                r.get("direction", ""),
-                r.get("from", ""),
-                r.get("to", ""),
-                r.get("body", "").replace("\n", " ").replace("\r", " "),
-                r.get("intent", ""),
-                r.get("twilio_message_sid", "") or "",
-            ]
-            # manual CSV safe quoting:
-            out = []
-            for cell in line:
-                cell = str(cell)
-                if any(ch in cell for ch in [",", '"', "\n"]):
-                    cell = '"' + cell.replace('"', '""') + '"'
-                out.append(cell)
-            yield ",".join(out) + "\n"
+# ---------- Admin Web UI (token protected) ----------
+ADMIN_HTML = """
+<!doctype html>
+<meta charset="utf-8">
+<title>Home Health Assistant — Admin</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu; margin:24px;}
+h1{margin:0 0 16px}
+input,button{font-size:14px;padding:8px}
+table{border-collapse:collapse;width:100%;margin-top:12px}
+th,td{border:1px solid #ddd;padding:6px 8px;font-size:13px}
+th{background:#f6f6f6;text-align:left}
+.badge{display:inline-block;padding:.15rem .4rem;border-radius:.35rem;background:#eef}
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.small{color:#666;font-size:12px}
+</style>
+<h1>Home Health Assistant — Admin</h1>
+<div class="controls">
+  <label>Token <input id="token" placeholder="token" /></label>
+  <label>Search <input id="q" placeholder="text filter" /></label>
+  <label>Limit <input id="limit" type="number" value="50" style="width:80px"/></label>
+  <button onclick="load()">Load</button>
+  <button onclick="downloadCSV()">Export CSV</button>
+  <span id="summary" class="small"></span>
+</div>
+<div id="intents"></div>
+<table id="tbl"><thead><tr></tr></thead><tbody></tbody></table>
+<script>
+async function load(){
+  const token=document.getElementById('token').value.trim();
+  const q=document.getElementById('q').value.trim();
+  const lim=document.getElementById('limit').value||50;
 
-    return Response(gen(), mimetype="text/csv", headers={
-        "Content-Disposition": "attachment; filename=messages_export.csv"
-    })
+  const h={ 'X-Debug-Token': token };
+  const base=window.location.origin;
 
-# -------------------------------
-# Self-test (quick smoke)
-# -------------------------------
-@app.route("/self-test", methods=["POST"])
-def self_test():
-    """
-    Quick end-to-end: simulate an inbound, then send an outbound (mock if needed)
-    """
-    start = time.time()
-    sim = app.test_client().post("/simulate-sms", json={"from": "tester", "body": "Yes please"})
-    snd = app.test_client().post("/send-sms", json={"to": "+10000000000", "body": "Appt confirmed"})
-    _record_metric("self_test", (time.time() - start) * 1000.0)
-    return jsonify({
-        "simulate_status": sim.status_code,
-        "send_status": snd.status_code,
-        "mode": MODE,
-        "twilio_ready": TWILIO_READY
-    })
+  const [msgs,ints]=await Promise.all([
+    fetch(`${base}/admin/messages?limit=${lim}&q=${encodeURIComponent(q)}`,{headers:h}).then(r=>r.json()),
+    fetch(`${base}/admin/intents`,{headers:h}).then(r=>r.json())
+  ]);
 
-# -------------------------------
-# Main
-# -------------------------------
-if __name__ == "__main__":
-    # Local run
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+  document.getElementById('summary').textContent=`${msgs.count} messages`;
+  const ic = (ints.intents||[]).map(i=>`<span class="badge">${i.intent}: ${i.count}</span>`).join(' ');
+  document.getElementById('intents').innerHTML = ic;
+
+  const rows=msgs.items||[];
+  const cols = Array.from(rows.reduce((s,r)=>{Object.keys(r).forEach(k=>s.add(k));return s;}, new Set()));
+  const thead=document.querySelector('#tbl thead tr'); thead.innerHTML="";
+  cols.forEach(c=>{ const th=document.createElement('th'); th.textContent=c; thead.appendChild(th); });
+
+  const tb=document.querySelector('#tbl tbody'); tb.innerHTML="";
+  rows.forEach(r=>{
+    const tr=document.createElement('tr');
+    cols.forEach(c=>{
+      const td=document.createElement('td');
+      td.textContent=(r[c]!==undefined)? String(r[c]) : "";
+      tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  });
+}
+async function downloadCSV(){
+  const token=document.getElementById('token').value.trim();
+  const base=window.location.origin;
+  const a=document.createElement('a');
+  a.href=`${base}/admin/export.csv`;
+  a.download="export.csv";
+  a.target="_blank";
+  a.rel="noopener";
+  a.click();
+}
+</script>
+"""
+
+@app.route("/admin", methods=["GET"])
+def admin_page():
+    # Don’t hard-block UI for token; page loads, but API calls require token header.
+    return Response(ADMIN_HTML, mimetype="text/html")
+
+# ---------- Debug dashboard (token optional) ----------
+@app.route("/debug", methods=["GET"])
+def debug_dash():
+    token_ok = _auth_ok(request) if DEBUG_TOKEN else True
+    color = "#0a0" if token_ok else "#a00"
+    snap = service_snapshot()
+    rows = [
+        ("MODE", snap["mode"]),
+        ("UPTIME (SEC)", snap["uptime_seconds"]),
+        ("TWILIO READY", snap["twilio_ready"]),
+        ("REGION", REGION),
+        ("BUILD ID", BUILD_ID),
+        ("GIT COMMIT", GIT_COMMIT or "local"),
+        ("VERSION", VERSION),
+        ("BUILD TIME", BUILD_TIME),
+    ]
+    html = [
+        "<!doctype html><meta charset='utf-8'><title>Debug</title>",
+        "<style>body{font:14px system-ui;margin:24px} table{border-collapse:collapse} td{border:1px solid #ddd;padding:6px 10px}</style>",
+        f"<h1>{APP_NAME} Debug Dashboard</h1>",
+        f"<p>Status: <b style='color:{color}'>{snap['status']}</b></p>",
+        "<table>",
+    ]
+    for k,v in rows:
+        html.append(f"<tr><td>{k}</td><td>{v}</td></tr>")
+    html.append("</table>")
+    if DEBUG_TOKEN:
+        html.append("<p class='small'>Tip: You can also use a query token if configured: <code>/debug?token=YOUR_TOKEN</code></p>")
+    return Response("\n".join(html), mimetype="text/html")

@@ -1,150 +1,241 @@
 import os
+import time
 import logging
-import json
-import uuid
-from datetime import datetime
+import threading
+from collections import Counter
 from flask import Flask, request, jsonify
 
-# --- Logging setup (JSON-ish lines, good for Render logs) ---
+# --- Optional Twilio import (app still runs without it) ---
+try:
+    from twilio.rest import Client as TwilioClient
+except Exception:
+    TwilioClient = None  # library not installed or unavailable
+
+# --- App & logging ---
+app = Flask(__name__)
+START_TIME = time.time()
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("homehealth")
 
-app = Flask(__name__)
+# --- Metrics (thread-safe) ---
+_metrics_lock = threading.Lock()
+REQ_COUNTER = Counter()          # per-route requests
+REQ_ERRORS = Counter()           # per-route errors
+LAT_SUM = Counter()              # per-route total latency (seconds * 1e6 to avoid float races)
+LAT_COUNT = Counter()            # per-route observed count
+SMS_COUNTER = Counter()          # sent, mocked, errors
+
+def _record_latency(route: str, seconds: float):
+    micros = int(seconds * 1_000_000)
+    with _metrics_lock:
+        LAT_SUM[route] += micros
+        LAT_COUNT[route] += 1
+
+def _inc(counter: Counter, key: str, n: int = 1):
+    with _metrics_lock:
+        counter[key] += n
+
+def uptime_seconds() -> float:
+    return round(time.time() - START_TIME, 2)
+
+def _avg_latency(route: str) -> float:
+    with _metrics_lock:
+        total = LAT_SUM[route]
+        cnt = LAT_COUNT[route]
+    return (total / 1_000_000.0 / cnt) if cnt else 0.0
+
+# --- Helpers ---
+def respond(payload: dict, status: int = 200):
+    payload = {
+        **payload,
+        "service": "Home Health Assistant",
+    }
+    return jsonify(payload), status
+
+def env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
 
 # --- Config / Env ---
+FLASK_ENV = os.getenv("FLASK_ENV", "").strip()
+PYTHON_VERSION = os.getenv("PYTHON_VERSION", "").strip()
+
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "").strip()
+DEFAULT_TO = os.getenv("DEFAULT_TO", "").strip()  # optional default recipient
 
-# Optional local dev phone override (for quick tests)
-DEFAULT_TO = os.getenv("DEFAULT_TO", "").strip()
+# Render/Git metadata if present
+RENDER_SERVICE_NAME = os.getenv("RENDER_SERVICE_NAME", "")
+RENDER_GIT_COMMIT = os.getenv("RENDER_GIT_COMMIT", "")
+RENDER_DEPLOY_ID = os.getenv("RENDER_DEPLOY_ID", "")
 
-# Decide if we are allowed to hit Twilio or run in mock mode
-TWILIO_READY = all([
-    TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN,
-    TWILIO_MESSAGING_SERVICE_SID
-])
+TWILIO_READY = all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_MESSAGING_SERVICE_SID])
+MODE = "live" if (TWILIO_READY and TwilioClient) else "mock"
 
+# Twilio client (only if ready)
 twilio_client = None
-if TWILIO_READY:
+if MODE == "live":
     try:
-        from twilio.rest import Client  # import only if creds exist
-        twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         log.info("Twilio client initialized.")
-    except Exception as e:
-        log.warning(f"Twilio import/init failed; falling back to mock. err={e}")
+    except Exception:
+        log.exception("Failed to initialize Twilio client; falling back to mock.")
         twilio_client = None
+        MODE = "mock"
 
-def req_id():
-    """Simple request-id for tracing."""
-    return request.headers.get("X-Request-ID") or str(uuid.uuid4())
+# --- Request hooks (for logs + metrics) ---
+@app.before_request
+def _log_request():
+    request._t0 = time.perf_counter()
+    path = request.path
+    log.info("REQ %s %s", request.method, path)
+    _inc(REQ_COUNTER, path)
 
-def respond(payload: dict, status=200):
-    """Uniform JSON responses with tracing & service metadata."""
-    body = {
-        "request_id": req_id(),
-        "service": "Home Health Assistant",
-        "mode": "twilio" if TWILIO_READY and twilio_client else "mock",
-        "twilio_ready": bool(TWILIO_READY and twilio_client),
-        "ts": datetime.utcnow().isoformat() + "Z",
-        **payload,
-    }
-    return jsonify(body), status
+@app.after_request
+def _after(resp):
+    t1 = time.perf_counter()
+    path = getattr(request, "path", "unknown")
+    _record_latency(path, t1 - getattr(request, "_t0", t1))
+    return resp
 
 # --- Routes ---
-
 @app.route("/", methods=["GET"])
 def root():
-    return respond({"status": "ok", "message": "Home Health Assistant API (Cloud) ✅"})
+    return "Home Health Assistant API (Cloud) ✅"
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    return respond({"status": "ok"})
+    return respond(
+        {
+            "mode": MODE,
+            "status": "ok",
+            "twilio_ready": bool(twilio_client),
+            "uptime_seconds": uptime_seconds(),
+        }
+    )
 
 @app.route("/version", methods=["GET"])
 def version():
-    return respond({
-        "status": "ok",
-        "version": os.getenv("APP_VERSION", "v1.0.0"),
-        "python": os.getenv("PYTHON_VERSION", ""),
-        "env": os.getenv("FLASK_ENV", ""),
-    })
+    return respond(
+        {
+            "build_id": RENDER_DEPLOY_ID or "local",
+            "deploy_id": RENDER_DEPLOY_ID or "local",
+            "git_commit": RENDER_GIT_COMMIT or "local",
+            "service_name": RENDER_SERVICE_NAME or "homehealth",
+        }
+    )
 
 @app.route("/debug/env", methods=["GET"])
 def debug_env():
-    # Safe peek (never show secrets!)
+    """Safe environment preview (booleans only; never echo secrets)."""
     safe = {
-        "FLASK_ENV": os.getenv("FLASK_ENV", ""),
-        "PYTHON_VERSION": os.getenv("PYTHON_VERSION", ""),
+        "FLASK_ENV": FLASK_ENV,
+        "PYTHON_VERSION": PYTHON_VERSION,
         "TWILIO_ACCOUNT_SID_present": bool(TWILIO_ACCOUNT_SID),
         "TWILIO_AUTH_TOKEN_present": bool(TWILIO_AUTH_TOKEN),
         "TWILIO_MESSAGING_SERVICE_SID_present": bool(TWILIO_MESSAGING_SERVICE_SID),
         "DEFAULT_TO_present": bool(DEFAULT_TO),
         "LOG_LEVEL": LOG_LEVEL,
+        "render": {
+            "service": bool(RENDER_SERVICE_NAME),
+            "git_commit_present": bool(RENDER_GIT_COMMIT),
+            "deploy_id_present": bool(RENDER_DEPLOY_ID),
+        },
     }
     return respond({"status": "ok", "env_preview": safe})
 
 @app.route("/send-sms", methods=["POST"])
 def send_sms():
-    """
-    Body:
-      { "to": "+1xxxxxxxxxx", "body": "hello" }
-    If TWILIO_READY=false -> returns mocked response.
-    """
-    rid = req_id()
+    """Send SMS using Twilio when configured; otherwise return mocked result."""
     data = request.get_json(silent=True) or {}
     to = (data.get("to") or DEFAULT_TO or "").strip()
-    body = (data.get("body") or "").strip()
+    body = (data.get("body") or "Hello from cloud").strip()
 
-    if not to or not body:
-        return respond({"status": "error", "error": "Missing 'to' or 'body'."}, status=400)
+    if not to:
+        _inc(REQ_ERRORS, request.path)
+        return respond({"status": "error", "message": "Missing 'to' and no DEFAULT_TO set."}, 400)
 
-    log.info(json.dumps({
-        "event": "send-sms.attempt",
-        "request_id": rid,
-        "to": to[-4:],  # last 4 only
-        "body_len": len(body),
-        "twilio_ready": bool(TWILIO_READY and twilio_client),
-    }))
-
-    if not (TWILIO_READY and twilio_client):
-        # Mocked path (safe before A2P approval)
+    if not twilio_client:
+        _inc(SMS_COUNTER, "mocked")
         return respond({"status": "mocked", "to": to, "body": body})
 
-    # Real Twilio path
     try:
         msg = twilio_client.messages.create(
-            messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
             to=to,
-            body=body
+            messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
+            body=body,
         )
-        log.info(json.dumps({
-            "event": "send-sms.sent",
-            "request_id": rid,
-            "sid": msg.sid,
-            "status": getattr(msg, "status", "unknown"),
-        }))
-        return respond({
-            "status": "sent",
-            "sid": msg.sid,
-            "to": to,
-            "body_len": len(body),
-        })
+        _inc(SMS_COUNTER, "sent")
+        return respond({"status": "sent-to-twilio", "to": to, "sid": msg.sid})
     except Exception as e:
-        log.error(json.dumps({
-            "event": "send-sms.error",
-            "request_id": rid,
-            "error": str(e),
-        }))
-        return respond({"status": "twilio-error", "error": str(e)}, status=502)
+        log.exception("Twilio send failed.")
+        _inc(SMS_COUNTER, "errors")
+        _inc(REQ_ERRORS, request.path)
+        return respond({"status": "twilio-error", "to": to, "error": str(e)}, 500)
 
-# Only for local dev (“python app.py”). Render uses gunicorn.
+# --- Metrics endpoints ---
+@app.route("/metrics", methods=["GET"])
+def metrics_json():
+    with _metrics_lock:
+        per_route = {
+            route: {
+                "requests": REQ_COUNTER[route],
+                "errors": REQ_ERRORS[route],
+                "avg_latency_seconds": round(_avg_latency(route), 6),
+            }
+            for route in set(list(REQ_COUNTER.keys()) + list(LAT_COUNT.keys()))
+        }
+        sms = dict(SMS_COUNTER)
+    return respond(
+        {
+            "status": "ok",
+            "uptime_seconds": uptime_seconds(),
+            "mode": MODE,
+            "twilio_ready": bool(twilio_client),
+            "routes": per_route,
+            "sms": sms,
+        }
+    )
+
+@app.route("/metrics.prom", methods=["GET"])
+def metrics_prom():
+    # Minimal Prometheus exposition
+    lines = []
+    with _metrics_lock:
+        lines.append(f'homehealth_uptime_seconds {uptime_seconds()}')
+        lines.append(f'homehealth_twilio_ready {{mode="{MODE}"}} {1 if twilio_client else 0}')
+        # Per-route
+        for route in set(list(REQ_COUNTER.keys()) + list(LAT_COUNT.keys())):
+            reqs = REQ_COUNTER[route]
+            errs = REQ_ERRORS[route]
+            avg = _avg_latency(route)
+            r = route.replace('"', '\\"')
+            lines.append(f'homehealth_requests_total{{route="{r}"}} {reqs}')
+            lines.append(f'homehealth_request_errors_total{{route="{r}"}} {errs}')
+            lines.append(f'homehealth_request_avg_latency_seconds{{route="{r}"}} {avg}')
+        # SMS
+        for k, v in SMS_COUNTER.items():
+            lines.append(f'homehealth_sms_total{{status="{k}"}} {v}')
+    return ("\n".join(lines) + "\n", 200, {"Content-Type": "text/plain; charset=utf-8"})
+
+# --- Error handling ---
+@app.errorhandler(404)
+def not_found(_):
+    _inc(REQ_ERRORS, request.path if request else "unknown")
+    return respond({"error": "not_found", "message": "Route does not exist"}, 404)
+
+@app.errorhandler(Exception)
+def unhandled(err):
+    log.exception("Unhandled error: %s", err)
+    _inc(REQ_ERRORS, request.path if request else "unknown")
+    return respond({"error": "internal_server_error", "message": str(err)}, 500)
+
+# --- Local run (Render uses gunicorn `app:app`) ---
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    log.info(f"Starting Flask on 0.0.0.0:{port} (local dev)…")
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)

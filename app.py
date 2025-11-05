@@ -1,11 +1,11 @@
 import os
 from flask import Flask, request, jsonify
 
-# Twilio is optional at runtime; we'll only use it if creds exist
+# --- Optional Twilio import (safe if library isn't installed yet) ---
 try:
-    from twilio.rest import Client  # type: ignore
+    from twilio.rest import Client
 except Exception:
-    Client = None  # library not strictly required for mock mode
+    Client = None  # library not present; stay in mock mode
 
 app = Flask(__name__)
 
@@ -14,12 +14,20 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "").strip()
 
-# If any Twilio secret is missing, we operate in mock mode (safe for A2P-unapproved phase)
-TWILIO_READY = all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_MESSAGING_SERVICE_SID])
+# If any Twilio secret is missing or the library isn't installed, we operate in mock mode
+TWILIO_READY = all([
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN,
+    TWILIO_MESSAGING_SERVICE_SID
+]) and (Client is not None)
 
 twilio_client = None
 if TWILIO_READY and Client is not None:
     twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# >>> New helpful boot message for logs <<<
+print("✅ Home Health Assistant API started successfully in",
+      "mock" if not TWILIO_READY else "live", "mode")
 
 # --- Routes ---
 
@@ -29,69 +37,39 @@ def root():
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    """
-    Lightweight health check for Render / uptime monitors.
-    """
-    return jsonify(
-        status="ok",
-        service="Home Health Assistant",
-        twilio_ready=bool(TWILIO_READY),
-        mode="live" if TWILIO_READY else "mock"
-    ), 200
+    return jsonify({
+        "service": "Home Health Assistant",
+        "status": "ok",
+        "mode": "mock" if not TWILIO_READY else "live",
+        "twilio_ready": TWILIO_READY
+    }), 200
 
 @app.route("/send-sms", methods=["POST"])
 def send_sms():
-    """
-    Body:
-    {
-      "to": "+1XXXXXXXXXX",
-      "body": "Message text"
-    }
-    """
     data = request.get_json(silent=True) or {}
-    to = (data.get("to") or "").strip()
-    body = (data.get("body") or "").strip()
+    to = data.get("to")
+    body = data.get("body", "")
 
-    if not to or not body:
-        return jsonify(error="Both 'to' and 'body' are required."), 400
+    if not to:
+        return jsonify({"error": "Missing 'to'"}), 400
+    if not body:
+        return jsonify({"error": "Missing 'body'"}), 400
 
-    # Mock mode (safe while A2P/10DLC campaign is pending)
+    # Mock mode (safe before A2P approval or without creds)
     if not TWILIO_READY or twilio_client is None:
-        return jsonify(
-            status="mocked",
-            to=to,
-            body=body,
-            note="Twilio not active; returning simulated success."
-        ), 200
+        return jsonify({"status": "mocked", "to": to, "body": body}), 200
 
-    # Live mode via Messaging Service
+    # Live mode
     try:
         msg = twilio_client.messages.create(
+            to=to,
             messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
-            to=to,
-            body=body,
-        )
-        return jsonify(
-            status="sent",
-            sid=msg.sid,
-            to=to,
             body=body
-        ), 200
+        )
+        return jsonify({"status": "sent", "sid": msg.sid}), 200
     except Exception as e:
-        # Don’t leak secrets; return safe error
-        return jsonify(status="twilio-error", error=str(e)[:400]), 502
+        return jsonify({"status": "twilio-error", "error": str(e)}), 502
 
-@app.route("/twilio-webhook", methods=["POST"])
-def twilio_webhook():
-    """
-    Twilio will POST inbound replies here (after you wire the webhook in the console).
-    For now we just acknowledge; later we’ll parse and route to therapists.
-    """
-    # You can inspect request.form for 'From', 'Body', etc.
-    # Example minimal OK:
-    return ("", 204)
-
-# Render/Heroku style entrypoint
-# (gunicorn uses: `gunicorn app:app`)
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    # Local dev server (Render uses gunicorn per your Start Command)
+    app.run(host="0.0.0.0", port=5000, debug=False)

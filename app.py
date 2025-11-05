@@ -529,26 +529,59 @@ input,button,select{padding:8px;font:inherit}
 .row{display:flex;justify-content:space-between;gap:8px}
 .small{color:#666;font-size:13px}
 .badge{background:#eef;padding:2px 6px;border-radius:6px}
+#auth{position:fixed;inset:0;background:#fff;display:flex;align-items:center;justify-content:center;flex-direction:column}
+#auth input{padding:10px;font:inherit;width:250px;text-align:center}
 </style>
-<h1>Day Schedule</h1>
-<div class=controls>
+
+<div id="auth">
+  <h2>Enter Access Token</h2>
+  <input id="tok" type="password" placeholder="DEBUG_TOKEN">
+  <button onclick="saveToken()">Access</button>
+  <p id="msg" style="color:red;display:none">Invalid token.</p>
+</div>
+
+<h1 style="display:none" id="title">Day Schedule</h1>
+<div class=controls style="display:none" id="controls">
   <label>Date <input id="d" type=date></label>
   <label>Therapist <input id="t" placeholder="(optional)"></label>
-  <label>Token <input id="tok" placeholder="DEBUG_TOKEN" size=40></label>
   <button onclick="load()">Load</button>
   <button onclick="opt()">Optimize</button>
 </div>
 <div id="list"></div>
+
 <script>
+let TOKEN = sessionStorage.getItem('debug_token') || '';
+function saveToken(){
+  TOKEN = document.getElementById('tok').value.trim();
+  if(!TOKEN){alert('Enter your token');return}
+  sessionStorage.setItem('debug_token', TOKEN);
+  verifyToken();
+}
+async function verifyToken(){
+  const r = await fetch('/healthz');
+  if(!r.ok){alert('Server unavailable');return}
+  // quick validation by calling protected route
+  const test = await fetch('/schedule',{headers:{'X-Debug-Token':TOKEN}});
+  if(test.status===401){
+    document.getElementById('msg').style.display='block';
+    sessionStorage.removeItem('debug_token');
+  }else{
+    document.getElementById('auth').style.display='none';
+    document.getElementById('title').style.display='';
+    document.getElementById('controls').style.display='';
+    load();
+  }
+}
+if(TOKEN){verifyToken();}
 const fmt = ts => new Date(ts*1000).toLocaleString();
 async function load(){
   const d=document.getElementById('d').value||new Date().toISOString().slice(0,10);
   const t=document.getElementById('t').value.trim();
-  const tok=document.getElementById('tok').value.trim();
   const url = `/schedule?date=${d}` + (t?`&therapist=${encodeURIComponent(t)}`:'');
-  const r=await fetch(url,{headers:{'X-Debug-Token':tok}});
-  if(!r.ok){alert('Auth or load error');return}
-  const j=await r.json(); const L=document.getElementById('list'); L.innerHTML='';
+  const r=await fetch(url,{headers:{'X-Debug-Token':TOKEN}});
+  const L=document.getElementById('list'); L.innerHTML='';
+  if(!r.ok){L.textContent='Auth or load error';return}
+  const j=await r.json();
   if(!j.appointments.length){L.textContent='No appointments.'; return;}
   j.appointments.forEach(a=>{
     const div=document.createElement('div'); div.className='card';
@@ -569,9 +602,8 @@ async function load(){
 async function opt(){
   const d=document.getElementById('d').value||new Date().toISOString().slice(0,10);
   const t=document.getElementById('t').value.trim();
-  const tok=document.getElementById('tok').value.trim();
   const r=await fetch('/schedule/optimize',{method:'POST',
-     headers:{'X-Debug-Token':tok,'Content-Type':'application/json'},
+     headers:{'X-Debug-Token':TOKEN,'Content-Type':'application/json'},
      body:JSON.stringify({date:d,therapist:t||null})});
   if(!r.ok){alert('Auth or optimize error');return}
   const j=await r.json(); alert('Optimized. DriveTime='+(j.drivetime?'ON':'OFF'));

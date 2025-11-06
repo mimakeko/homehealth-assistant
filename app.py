@@ -1,46 +1,55 @@
-import os, time, json, csv, io, math
+# app.py
+# Home Health Assistant – unified Flask app
+# Includes: health/metrics/admin/simulate/send/schedule UI + Google test endpoints
+
+import os, json, time, csv, io
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlencode
+from collections import Counter
 
-import requests
-from flask import (
-    Flask, request, jsonify, abort, make_response,
-    Response
-)
+from flask import Flask, request, jsonify, make_response, abort
 
-# -----------------------------
-# App
-# -----------------------------
+# requests is only used for Google APIs; import gently
+try:
+    import requests
+except Exception:
+    requests = None
+
 app = Flask(__name__)
 
-START_TS = time.time()
-
-# -----------------------------
+# ---------------------------------------------------------
 # Env / Config
-# -----------------------------
-DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "").strip()
-DEBUG_USER  = os.getenv("DEBUG_USER",  "").strip()
+# ---------------------------------------------------------
+SERVICE_NAME = "Home Health Assistant"
+BUILD_ID = os.getenv("HEROKU_SLUG_COMMIT") or os.getenv("RENDER_GIT_COMMIT") or "local"
+REGION = os.getenv("RENDER_REGION", "local")
+APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 
-TWILIO_ACCOUNT_SID        = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
-TWILIO_AUTH_TOKEN         = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-TWILIO_MESSAGING_SERVICE  = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "").strip()
-TWILIO_READY              = all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_MESSAGING_SERVICE])
+DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "").strip()
+DEBUG_USER = os.getenv("DEBUG_USER", "admin").strip()
+
+# Twilio envs are optional at runtime
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID", "").strip()
+TWILIO_READY = all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_MESSAGING_SERVICE_SID])
 
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
-MAPS_READY = bool(GOOGLE_MAPS_API_KEY)
+MAPS_READY = bool(GOOGLE_MAPS_API_KEY and requests)
 
-STORE_BACKEND = os.getenv("STORE_BACKEND", "json").strip().lower()   # "json" (default) or "sqlite" (future)
-STORE_PATH    = os.getenv("STORE_PATH", "/tmp/hha_store.json").strip()
+STORE_BACKEND = os.getenv("STORE_BACKEND", "json").strip().lower()  # json or sqlite (json default)
+ADMIN_PAGE_SIZE = int(os.getenv("ADMIN_PAGE_SIZE", "50"))
+RATE_LIMIT_WINDOW_SEC = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
+RATE_LIMIT_MAX_SIMULATE = int(os.getenv("RATE_LIMIT_MAX_SIMULATE", "30"))
 
-ADMIN_PAGE_SIZE        = int(os.getenv("ADMIN_PAGE_SIZE", "50"))
-RATE_LIMIT_WINDOW_SEC  = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
-RATE_LIMIT_MAX_SIM     = int(os.getenv("RATE_LIMIT_MAX_SIMULATE", "30"))
+# ---------------------------------------------------------
+# Runtime state / store (simple JSON file; safe for Render)
+# ---------------------------------------------------------
+DATA_DIR = os.path.abspath("./data")
+os.makedirs(DATA_DIR, exist_ok=True)
+STORE_PATH = os.path.join(DATA_DIR, "store.json")
 
-# -----------------------------
-# Simple JSON Store
-# -----------------------------
-def _load_store() -> Dict[str, Any]:
+def _load_store():
     if not os.path.exists(STORE_PATH):
         return {"messages": []}
     try:
@@ -49,418 +58,482 @@ def _load_store() -> Dict[str, Any]:
     except Exception:
         return {"messages": []}
 
-def _save_store(data: Dict[str, Any]) -> None:
+def _save_store(store):
     tmp = STORE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(store, f, ensure_ascii=False)
     os.replace(tmp, STORE_PATH)
 
-def _append_message(msg: Dict[str, Any]) -> None:
-    data = _load_store()
-    data.setdefault("messages", []).append(msg)
-    _save_store(data)
+def add_message(direction, kind, body, to="", note=""):
+    store = _load_store()
+    store.setdefault("messages", [])
+    store["messages"].append({
+        "direction": direction,          # 'in' or 'out'
+        "kind": kind,                    # 'simulate' or 'twilio'
+        "body": body,
+        "to": to,
+        "note": note,
+        "ts": time.time()
+    })
+    _save_store(store)
 
-# -----------------------------
-# Auth helper (header, query, or cookie)
-# -----------------------------
-def _get_token_from_request() -> str:
-    # priority: header -> query -> cookie
-    token = request.headers.get("X-Debug-Token", "").strip()
-    if not token:
-        token = request.args.get("token", "").strip()
-    if not token:
-        token = request.cookies.get("debug_token", "").strip()
-    return token
+def list_messages(limit=50, text_filter=None):
+    store = _load_store()
+    msgs = list(reversed(store.get("messages", [])))
+    if text_filter:
+        t = text_filter.lower()
+        msgs = [m for m in msgs if t in (m.get("body","").lower())]
+    return msgs[:max(1, min(1000, limit))]
 
-def _require_token() -> None:
-    if not DEBUG_TOKEN:
-        # if you haven't set a token, allow (dev mode)
-        return
-    token = _get_token_from_request()
-    if token != DEBUG_TOKEN:
+# ---------------------------------------------------------
+# Auth helpers (same as before): header, query, or cookie
+# ---------------------------------------------------------
+def get_token_from_request():
+    # 1) Header
+    tok = request.headers.get("X-Debug-Token", "").strip()
+    if tok:
+        return tok
+    # 2) Query
+    tok = request.args.get("token", "").strip()
+    if tok:
+        return tok
+    # 3) Cookie
+    tok = request.cookies.get("access_token", "").strip()
+    return tok
+
+def require_token():
+    tok = get_token_from_request()
+    if not DEBUG_TOKEN or tok != DEBUG_TOKEN:
         abort(401)
 
-# -----------------------------
-# Utility
-# -----------------------------
-def _uptime_seconds() -> float:
-    return round(time.time() - START_TS, 2)
+# ---------------------------------------------------------
+# Health / Metrics / Debug
+# ---------------------------------------------------------
+start_time = time.time()
 
-def _json_ok(obj: Dict[str, Any]) -> Response:
-    return make_response(jsonify(obj), 200)
+def uptime_seconds():
+    return round(time.time() - start_time, 2)
 
-def _json_err(msg: str, code: int = 400) -> Response:
-    return make_response(jsonify({"error": "bad_request", "message": msg}), code)
-
-# -----------------------------
-# Google Maps helpers
-# -----------------------------
-MAPS_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
-MAPS_DISTANCE_URL = "https://maps.googleapis.com/maps/api/distancematrix/json"
-
-def geocode_address(addr: str) -> Optional[Tuple[float, float, str]]:
-    """Return (lat, lon, formatted_address) or None."""
-    if not MAPS_READY:
-        return None
-    try:
-        r = requests.get(MAPS_GEOCODE_URL, params={"address": addr, "key": GOOGLE_MAPS_API_KEY}, timeout=10)
-        j = r.json()
-        if j.get("status") != "OK" or not j.get("results"):
-            return None
-        res = j["results"][0]
-        loc = res["geometry"]["location"]
-        return (loc["lat"], loc["lng"], res.get("formatted_address", addr))
-    except Exception:
-        return None
-
-def distance_matrix(orig: Tuple[float, float], dest: Tuple[float, float]) -> Optional[Dict[str, Any]]:
-    """Return {seconds, meters, text_distance, text_duration} or None."""
-    if not MAPS_READY:
-        return None
-    try:
-        params = {
-            "origins": f"{orig[0]},{orig[1]}",
-            "destinations": f"{dest[0]},{dest[1]}",
-            "key": GOOGLE_MAPS_API_KEY
-        }
-        r = requests.get(MAPS_DISTANCE_URL, params=params, timeout=10)
-        j = r.json()
-        if j.get("status") != "OK":
-            return None
-        rows = j.get("rows", [])
-        if not rows or not rows[0].get("elements"):
-            return None
-        el = rows[0]["elements"][0]
-        if el.get("status") != "OK":
-            return None
-        return {
-            "seconds": el["duration"]["value"],
-            "meters": el["distance"]["value"],
-            "text_distance": el["distance"]["text"],
-            "text_duration": el["duration"]["text"],
-        }
-    except Exception:
-        return None
-
-# -----------------------------
-# Routes
-# -----------------------------
 @app.route("/", methods=["GET"])
 def root():
-    return "Home Health Assistant API (Cloud) ✅"
+    return jsonify({"service": SERVICE_NAME, "status": "ok", "mode": "mock"})
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    return _json_ok({
+    return jsonify({
         "mode": "mock" if not TWILIO_READY else "live",
-        "service": "Home Health Assistant",
+        "service": SERVICE_NAME,
         "status": "ok",
         "twilio_ready": TWILIO_READY,
         "maps_ready": MAPS_READY,
-        "uptime_seconds": _uptime_seconds(),
+        "uptime_seconds": uptime_seconds()
     })
 
-@app.route("/version", methods=["GET"])
-def version():
-    build_id = os.getenv("RENDER_GIT_COMMIT", "local")
-    region   = os.getenv("RENDER_REGION", "local")
-    ver      = os.getenv("HHA_VERSION", "1.0.0")
-    build_ts = datetime.utcfromtimestamp(START_TS).isoformat() + "Z"
-    return _json_ok({
-        "build_id": build_id,
-        "region": region,
-        "git_commit": build_id[:7] if build_id != "local" else "local",
-        "service": "Home Health Assistant",
-        "version": ver,
-        "build_time": build_ts
+# basic counters
+COUNTERS = {
+    "requests": 0,
+    "errors": 0,
+    "avg_latency_seconds": 0.0,
+}
+def _observe(latency):
+    COUNTERS["requests"] += 1
+    # simple moving average
+    r = COUNTERS["requests"]
+    COUNTERS["avg_latency_seconds"] = (
+        ((r - 1) * COUNTERS["avg_latency_seconds"] + latency) / r
+    )
+
+@app.before_request
+def _start_timer():
+    request._t0 = time.time()
+
+@app.after_request
+def _stop_timer(resp):
+    try:
+        dt = max(0.0, time.time() - getattr(request, "_t0", time.time()))
+        _observe(dt)
+    except Exception:
+        pass
+    return resp
+
+@app.errorhandler(500)
+def _server_error(e):
+    COUNTERS["errors"] += 1
+    return make_response("<h1>Internal Server Error</h1>", 500)
+
+@app.route("/metrics", methods=["GET"])
+def metrics_json():
+    return jsonify({
+        "status": "ok",
+        "service": SERVICE_NAME,
+        "mode": "mock" if not TWILIO_READY else "live",
+        "uptime_seconds": uptime_seconds(),
+        "healthz": {
+            "requests": COUNTERS["requests"],
+            "errors": COUNTERS["errors"],
+            "avg_latency_seconds": round(COUNTERS["avg_latency_seconds"], 5),
+        },
+        "sms": {"twilio_ready": TWILIO_READY},
+        "build_id": BUILD_ID,
+        "region": REGION,
+        "git_commit": os.getenv("RENDER_GIT_COMMIT", BUILD_ID),
+        "version": APP_VERSION,
     })
 
-# --- SMS (mock until Twilio campaign live) ---
-@app.route("/send-sms", methods=["POST"])
-def send_sms():
-    _require_token()
-    data = request.get_json(silent=True) or {}
-    to = (data.get("to") or "").strip()
-    body = (data.get("body") or "").strip()
-    if not to or not body:
-        return _json_err("Missing 'to' or 'body'")
-    # record the outbound message (mock)
-    _append_message({
-        "ts": time.time(),
-        "kind": "simulate",
-        "direction": "out",
-        "to": to,
-        "body": body,
-        "note": "auto-confirm" if "confirm" in body.lower() else "",
-    })
-    return _json_ok({"sid": f"mock-{int(time.time()*1000)}", "status": "mock-sent"})
+@app.route("/metrics.prom", methods=["GET"])
+def metrics_prom():
+    # minimal Prometheus exposition
+    lines = [
+        "# HELP hha_requests_total Total requests",
+        "# TYPE hha_requests_total counter",
+        f"hha_requests_total {COUNTERS['requests']}",
+        "# HELP hha_errors_total Total errors",
+        "# TYPE hha_errors_total counter",
+        f"hha_errors_total {COUNTERS['errors']}",
+        "# HELP hha_latency_seconds_avg Average latency (s)",
+        "# TYPE hha_latency_seconds_avg gauge",
+        f"hha_latency_seconds_avg {COUNTERS['avg_latency_seconds']}",
+        "# HELP hha_uptime_seconds Uptime (s)",
+        "# TYPE hha_uptime_seconds gauge",
+        f"hha_uptime_seconds {uptime_seconds()}",
+    ]
+    return ("\n".join(lines) + "\n", 200, {"Content-Type": "text/plain; charset=utf-8"})
 
-@app.route("/simulate-sms", methods=["POST"])
-def simulate_sms():
-    """Add an inbound message (simulate patient reply)."""
-    _require_token()
-    data = request.get_json(silent=True) or {}
-    to   = (data.get("to") or "").strip()  # their phone
-    body = (data.get("body") or "").strip()
-    if not to or not body:
-        return _json_err("Missing 'to' or 'body'")
-    _append_message({
-        "ts": time.time(),
-        "kind": "simulate",
-        "direction": "in",
-        "to": to,
-        "body": body,
-        "note": "",
-    })
-    # Very lightweight intent tagging for demo
-    intent = "confirm" if "confirm" in body.lower() or "yes" in body.lower() else "other"
-    return _json_ok({"echo": body, "intent": intent, "ok": True})
+# Simple debug page (token required)
+@app.route("/debug", methods=["GET"])
+def debug_page():
+    tok = get_token_from_request()
+    if not DEBUG_TOKEN or tok != DEBUG_TOKEN:
+        # tiny HTML prompt
+        html = f"""<!doctype html><meta charset="utf-8">
+        <h1>Enter Access Token</h1>
+        <form method="get">
+          <input name="token" placeholder="DEBUG_TOKEN" size="40">
+          <button>Access</button>
+        </form>"""
+        return (html, 401)
+    # show dashboard
+    html = f"""<!doctype html><meta charset="utf-8">
+    <title>Home Health Assistant Debug Dashboard</title>
+    <h1>Home Health Assistant Debug Dashboard</h1>
+    <p>Status: <b>ok</b></p>
+    <table border="1" cellpadding="6">
+      <tr><td>MODE</td><td>{"mock" if not TWILIO_READY else "live"}</td></tr>
+      <tr><td>UPTIME (SEC)</td><td>{uptime_seconds():.2f}</td></tr>
+      <tr><td>TWILIO READY</td><td>{TWILIO_READY}</td></tr>
+      <tr><td>MAPS READY</td><td>{MAPS_READY}</td></tr>
+      <tr><td>REGION</td><td>{REGION}</td></tr>
+      <tr><td>BUILD ID</td><td>{BUILD_ID}</td></tr>
+      <tr><td>GIT COMMIT</td><td>{os.getenv("RENDER_GIT_COMMIT", BUILD_ID)}</td></tr>
+      <tr><td>VERSION</td><td>{APP_VERSION}</td></tr>
+      <tr><td>BUILD TIME</td><td>{datetime.utcnow().isoformat()}+00:00</td></tr>
+    </table>
+    <p>Tip: You can also use a query token if configured: <code>/debug?token=YOUR_TOKEN</code></p>
+    """
+    resp = make_response(html)
+    # set cookie for 5 days (UI uses this)
+    resp.set_cookie("access_token", DEBUG_TOKEN, max_age=5 * 24 * 3600, httponly=False, samesite="Lax")
+    return resp
 
-# --- Admin / export (token required) ---
+# ---------------------------------------------------------
+# Admin endpoints (token protected)
+# ---------------------------------------------------------
 @app.route("/admin/messages", methods=["GET"])
 def admin_messages():
-    _require_token()
-    limit = max(1, min(1000, int(request.args.get("limit", str(ADMIN_PAGE_SIZE)))))
-    q = (request.args.get("q") or "").strip().lower()
-    data = _load_store()
-    msgs = list(reversed(data.get("messages", [])))
-    if q:
-        msgs = [m for m in msgs if q in json.dumps(m).lower()]
-    msgs = msgs[:limit]
-    return _json_ok({"messages": msgs})
+    require_token()
+    limit = int(request.args.get("limit", ADMIN_PAGE_SIZE))
+    text = request.args.get("search", "").strip() or None
+    return jsonify(list_messages(limit=limit, text_filter=text))
+
+@app.route("/admin/intents", methods=["GET"])
+def admin_intents():
+    require_token()
+    msgs = list_messages(limit=1000)
+    intents = Counter()
+    for m in msgs:
+        body = m.get("body", "").lower()
+        if "confirm" in body:
+            intents["confirm"] += 1
+        else:
+            intents["other"] += 1
+    return jsonify({"intents": [{"intent": k, "count": v} for k, v in intents.items()]})
 
 @app.route("/admin/export.csv", methods=["GET"])
 def admin_export_csv():
-    _require_token()
-    data = _load_store().get("messages", [])
+    require_token()
+    msgs = list_messages(limit=1000)
     out = io.StringIO()
-    writer = csv.writer(out)
-    writer.writerow(["ts", "direction", "kind", "note", "to", "body"])
-    for m in data:
-        writer.writerow([m.get("ts"), m.get("direction"), m.get("kind"), m.get("note"), m.get("to"), m.get("body")])
-    resp = make_response(out.getvalue(), 200)
-    resp.headers["Content-Type"] = "text/csv"
-    resp.headers["Content-Disposition"] = "attachment; filename=export.csv"
+    w = csv.writer(out)
+    w.writerow(["direction", "kind", "body", "to", "note", "ts"])
+    for m in msgs:
+        w.writerow([m.get("direction",""), m.get("kind",""), m.get("body",""), m.get("to",""), m.get("note",""), m.get("ts","")])
+    resp = make_response(out.getvalue())
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    resp.headers["Content-Disposition"] = 'attachment; filename="export.csv"'
     return resp
 
-# --- Schedule API (token required) ---
-@app.route("/schedule", methods=["GET"])
-def schedule_get():
-    _require_token()
-    date = request.args.get("date", "").strip()
-    therapist = (request.args.get("therapist") or "").strip()
-    if not date:
-        return _json_err("Missing date (YYYY-MM-DD)")
-    # For now: return empty "appointments" skeleton. You can later fill from Airtable/DB.
-    return _json_ok({
-        "date": date,
-        "therapist": therapist or None,
-        "appointments": []
-    })
+# simple HTML admin UI (token box)
+ADMIN_HTML = """<!doctype html><meta charset="utf-8"><title>Home Health Assistant — Admin</title>
+<h1>Home Health Assistant — Admin</h1>
+<label>Token <input id="tok" size="40" placeholder="DEBUG_TOKEN"></label>
+<label>Search <input id="q" placeholder="text filter"></label>
+<label>Limit <input id="lim" type="number" value="50"></label>
+<button onclick="load()">Load</button>
+<button onclick="csv()">Export CSV</button>
+<div id="n"></div>
+<table border="1" cellpadding="6" id="t"></table>
+<script>
+async function load(){
+  const tok = document.getElementById('tok').value.trim();
+  const q = document.getElementById('q').value.trim();
+  const lim = document.getElementById('lim').value || '50';
+  const r = await fetch(`/admin/messages?limit=${lim}&search=${encodeURIComponent(q)}`, {headers:{'X-Debug-Token':tok}});
+  if(!r.ok){ alert('Auth or fetch error'); return; }
+  const data = await r.json();
+  document.getElementById('n').textContent = `${data.length} messages`;
+  const rows = ['<tr><th>body</th><th>direction</th><th>kind</th><th>note</th><th>to</th><th>ts</th></tr>']
+  data.forEach(m=>{
+    rows.push(`<tr><td>${m.body||''}</td><td>${m.direction||''}</td><td>${m.kind||''}</td><td>${m.note||''}</td><td>${m.to||''}</td><td>${m.ts||''}</td></tr>`)
+  });
+  document.getElementById('t').innerHTML = rows.join('');
+}
+function csv(){
+  const tok = document.getElementById('tok').value.trim();
+  const u = `/admin/export.csv`;
+  fetch(u, {headers:{'X-Debug-Token':tok}}).then(async r=>{
+    if(!r.ok){ alert('Auth error'); return; }
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'export.csv';
+    a.click();
+  });
+}
+</script>
+"""
+@app.route("/admin", methods=["GET"])
+def admin_ui():
+    return ADMIN_HTML
 
-@app.route("/schedule/optimize", methods=["POST"])
-def schedule_optimize():
-    _require_token()
-    data = request.get_json(silent=True) or {}
-    date = (data.get("date") or "").strip()
-    therapist = (data.get("therapist") or "").strip()
-    appts: List[Dict[str, Any]] = data.get("appointments") or []
+# ---------------------------------------------------------
+# SMS simulate / send (send is mock while A2P not ready)
+# ---------------------------------------------------------
+@app.route("/simulate-sms", methods=["POST"])
+def simulate_sms():
+    data = request.get_json(force=True, silent=True) or {}
+    body = (data.get("body") or "").strip()
+    add_message("in", "simulate", body, to="", note="")
+    ok = True
+    intent = "confirm" if "confirm" in body.lower() else "other"
+    return jsonify({"ok": ok, "intent": intent, "echo": body})
 
-    if not date:
-        return _json_err("Missing 'date' in body")
-    # If addresses are provided, compute basic pairwise drive time for successive stops.
-    drive_time_total = 0
-    if MAPS_READY and appts:
-        # Geocode each appointment address
-        coords: List[Optional[Tuple[float, float]]] = []
-        for a in appts:
-            addr = (a.get("address") or "").strip()
-            g = geocode_address(addr) if addr else None
-            if g:
-                a["lat"], a["lon"], a["address_norm"] = g[0], g[1], g[2]
-                coords.append((g[0], g[1]))
-            else:
-                a["lat"], a["lon"] = None, None
-                coords.append(None)
+@app.route("/send-sms", methods=["POST"])
+def send_sms():
+    data = request.get_json(force=True, silent=True) or {}
+    to = (data.get("to") or "").strip()
+    body = (data.get("body") or "").strip()
+    # For now, mock send regardless of TWILIO_READY to keep it safe.
+    add_message("out", "simulate", body, to=to, note="auto-confirm")
+    return jsonify({"status": "mock-sent", "sid": f"mock-{int(time.time()*1000)}"})
 
-        # naive sequence cost (as-is order)
-        for i in range(len(coords) - 1):
-            if coords[i] and coords[i+1]:
-                dm = distance_matrix(coords[i], coords[i+1])
-                if dm:
-                    appts[i]["drive_to_next_sec"] = dm["seconds"]
-                    appts[i]["drive_to_next_text"] = dm["text_duration"]
-                    appts[i]["drive_to_next_m"] = dm["meters"]
-                    drive_time_total += dm["seconds"]
-
-    return _json_ok({
-        "ok": True,
-        "therapist": therapist or None,
-        "date": date,
-        "drive_time": bool(drive_time_total),
-        "drive_time_seconds": drive_time_total,
-        "appointments": appts
-    })
-
-# --- Simple token-gated Schedule UI ---
-UI_SCHEDULE = """
-<!doctype html>
-<meta charset="utf-8"><title>Schedule</title>
-<meta name=viewport content="width=device-width, initial-scale=1">
+# ---------------------------------------------------------
+# Simple scheduling UI + endpoints
+# ---------------------------------------------------------
+UI_SCHEDULE = """<!doctype html><meta charset="utf-8"><title>Schedule</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body{font:15px system-ui;margin:16px}
 h1{margin:0 0 10px}
-.controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-input,button,select{padding:8px;inherit:inherit}
-.card{border:1px solid #ddd;border-radius:8px;padding:10px;margin:8px 0}
+controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+input,button,select{padding:8px;font:inherit}
+card{border:1px solid #ddd;border-radius:8px;padding:10px;margin:8px 0}
+row{display:flex;justify-content:space-between;gap:8px}
 .badge{background:#eef;padding:2px 6px;border-radius:6px}
-.small{color:#666;font-size:13px}
-.note{color:#444}
 </style>
 <h1>Day Schedule</h1>
-<div class=controls>
-  <label>Date <input id="d" type=date></label>
+<div class="controls">
+  <label>Date <input id="d" type="date"></label>
   <label>Therapist <input id="t" placeholder="(optional)"></label>
   <button onclick="load()">Load</button>
   <button onclick="opt()">Optimize</button>
-  <span id="tokmsg" class="small"></span>
+  <small id="tokMsg"></small>
 </div>
 <div id="list"></div>
 <script>
-const fmt = ts => new Date(ts*1000).toLocaleString();
-
-function getCookie(name){
-  const m = document.cookie.match(new RegExp('(^| )'+name+'=([^;]+)'));
-  return m ? decodeURIComponent(m[2]) : '';
-}
-
-async function ensureToken(){
-  let tok = getCookie('debug_token');
-  if(!tok){
-    const q = new URLSearchParams(location.search).get('token') || '';
-    if(q){ document.cookie = 'debug_token='+encodeURIComponent(q)+'; Max-Age=2592000; path=/'; tok=q; }
-  }
-  if(!tok){
-    const t = prompt('Enter access token'); 
-    if(t){ document.cookie = 'debug_token='+encodeURIComponent(t)+'; Max-Age=2592000; path=/'; return t; }
-  }
-  return tok;
-}
-
-async function autoload(){
+(function init(){
   const today = new Date().toISOString().slice(0,10);
   document.getElementById('d').value = today;
-  const tok = await ensureToken();
-  document.getElementById('tokmsg').textContent = tok ? 'Token set in cookie for 30d' : 'No token';
-}
-autoload();
+  const tok = new URLSearchParams(location.search).get('token') || '';
+  if(tok){
+    document.cookie = 'access_token='+tok+'; max-age='+(5*24*3600)+'; path=/; samesite=Lax';
+    document.getElementById('tokMsg').textContent = 'Token set in cookie for 5d.';
+  }
+})();
+function fmt(ts){ return new Date(ts*1000).toLocaleString(); }
 
 async function load(){
   const date = document.getElementById('d').value || new Date().toISOString().slice(0,10);
-  const t = document.getElementById('t').value.trim();
-  const tok = getCookie('debug_token');
-  try{
-    const r = await fetch(`/schedule?date=${encodeURIComponent(date)}&therapist=${encodeURIComponent(t)}`,{
-      headers:{'X-Debug-Token': tok||''}
-    });
-    if(!r.ok){ throw new Error(await r.text()); }
-    const j = await r.json();
-    const L = document.getElementById('list'); L.innerHTML='';
-    if(!j.appointments || !j.appointments.length){
-      const d = document.createElement('div'); d.className='small note';
-      d.textContent = 'No appointments yet. Use Optimize to compute drive-time if you add addresses.';
-      L.appendChild(d); return;
-    }
-    j.appointments.forEach(a=>{
-      const d = document.createElement('div'); d.className='card';
-      d.innerHTML = `
-        <div><b>${a.patient_name||'(unknown)'}</b> <span class=badge>${a.status||''}</span></div>
-        <div class=small>${a.start_iso||''}</div>
-        <div class=small>${a.address_norm||a.address||''}</div>
-        <div class=small>${(a.lat!=null&&a.lon!=null)?('Lat,Lon: '+a.lat+','+a.lon):''}</div>
-        <div class=small>${a.patient_phone?('<a href="tel:'+a.patient_phone+'">Call</a>'):''}
-            ${(a.lat!=null&&a.lon!=null)?(' · <a target=_blank href="https://maps.google.com/?q='+a.lat+','+a.lon+'">Map</a>'):''}
-        </div>
-        <div class=small>${a.drive_to_next_text?('Drive to next: '+a.drive_to_next_text):''}</div>
-      `;
-      L.appendChild(d);
-    });
-  }catch(e){
-    alert('Load error: '+e.message);
-  }
+  const therapist = document.getElementById('t').value.trim();
+  const r = await fetch(`/schedule?date=${encodeURIComponent(date)}${therapist?`&therapist=${encodeURIComponent(therapist)}`:''}`);
+  if(!r.ok){ alert('Load error: HTTP '+r.status+' '+(await r.text())); return; }
+  const j = await r.json();
+  const L = document.getElementById('list'); L.innerHTML = '';
+  (j.appointments||[]).forEach(a=>{
+    const div = document.createElement('card');
+    div.innerHTML = `<b>${a.patient_name||'(unknown)'}</b> <span class="badge">${a.status||''}</span>
+      <div class="small">${a.start_iso||''}</div>
+      <div class="small">${a.address||''}, ${a.city||''}, ${a.state||''} ${a.zip||''}</div>
+      <div class="small">${a.lat!=null && a.lon!=null ? ('Lat,Lon: '+a.lat+', '+a.lon) : ''}</div>
+      <div class="small">phone: ${a.patient_phone||''}</div>`;
+    L.appendChild(div);
+  });
 }
-
 async function opt(){
   const date = document.getElementById('d').value || new Date().toISOString().slice(0,10);
-  const t = document.getElementById('t').value.trim();
-  const tok = getCookie('debug_token');
-  // In this first pass we just send an empty appointments list; later you’ll pass real stops.
-  const body = {date, therapist: t, appointments: []};
-  try{
-    const r = await fetch('/schedule/optimize',{
-      method:'POST',
-      headers:{'X-Debug-Token': tok||'', 'Content-Type':'application/json'},
-      body: JSON.stringify(body)
-    });
-    if(!r.ok){ throw new Error(await r.text()); }
-    const j = await r.json();
-    alert('Optimized. Drive-time computed: '+(j.drive_time ? 'YES':'NO'));
-  }catch(e){
-    alert('Optimize error: '+e.message);
-  }
+  const therapist = document.getElementById('t').value.trim();
+  const r = await fetch('/schedule/optimize',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({date,therapist})});
+  if(!r.ok){ alert('Optimize error: '+(await r.text())); return; }
+  const j = await r.json();
+  alert('Optimized. DriveTime: '+(j.drive_time?'ON':'OFF'));
 }
 </script>
 """
 
 @app.route("/ui/schedule", methods=["GET"])
 def ui_schedule():
-    # Gate with token: header/query/cookie all allowed.
-    token = _get_token_from_request()
-    if DEBUG_TOKEN and token != DEBUG_TOKEN and not request.cookies.get("debug_token"):
-        # Show a minimal HTML prompt if no cookie and wrong/no token
-        html = """
-        <h2>Enter Access Token</h2>
+    # Require token (header/query/cookie). If missing show password box.
+    tok = get_token_from_request()
+    if not DEBUG_TOKEN or tok != DEBUG_TOKEN:
+        html = f"""<!doctype html><meta charset="utf-8">
+        <h1>Enter Access Token</h1>
         <form method="get">
-          <input name="token" placeholder="DEBUG_TOKEN" style="padding:8px" size=40>
-          <button style="padding:8px">Access</button>
-        </form>
-        """
-        return make_response(html, 401)
-    # if a ?token= is provided, set a cookie then render the UI
-    resp = make_response(UI_SCHEDULE, 200)
-    if token:
-        resp.set_cookie("debug_token", token, max_age=60*60*24*30, httponly=False, secure=True, samesite="Lax")
+          <input name="token" placeholder="DEBUG_TOKEN" size="40">
+          <button>Access</button>
+        </form>"""
+        return (html, 401)
+    # set cookie so user doesn’t have to paste token again
+    resp = make_response(UI_SCHEDULE)
+    resp.set_cookie("access_token", DEBUG_TOKEN, max_age=5 * 24 * 3600, httponly=False, samesite="Lax")
     return resp
 
-# --- Metrics ---
-@app.route("/metrics", methods=["GET"])
-def metrics_json():
-    # safe JSON (not Prometheus). Good for quick checks.
-    return _json_ok({
-        "status": "ok",
-        "service": "Home Health Assistant",
-        "mode": "mock" if not TWILIO_READY else "live",
-        "uptime_seconds": _uptime_seconds(),
-        "routes": {
-            "/": {"requests": 0, "errors": 0},
-        },
-        "sms": {"twilio_ready": TWILIO_READY},
-        "maps": {"maps_ready": MAPS_READY},
-    })
+@app.route("/schedule", methods=["GET"])
+def schedule_get():
+    # Require cookie/header token (read-only data too)
+    require_token()
+    date = (request.args.get("date") or datetime.utcnow().date().isoformat()).strip()
+    therapist = (request.args.get("therapist") or "").strip()
 
-@app.route("/metrics.prom", methods=["GET"])
-def metrics_prom():
-    # micro Prometheus-format snapshot
-    lines = [
-        f'hha_uptime_seconds {_uptime_seconds()}',
-        f'hha_twilio_ready {1 if TWILIO_READY else 0}',
-        f'hha_maps_ready {1 if MAPS_READY else 0}',
-    ]
-    return Response("\n".join(lines) + "\n", mimetype="text/plain; charset=utf-8")
+    # Demo stub data
+    appts = [{
+        "patient_name": "John Doe",
+        "start_iso": f"{date}T09:30:00",
+        "status": "Scheduled",
+        "address": "1 Apple Park Way",
+        "city": "Cupertino",
+        "state": "CA",
+        "zip": "95014",
+        "patient_phone": "+14085550100",
+    },{
+        "patient_name": "Jane Smith",
+        "start_iso": f"{date}T11:00:00",
+        "status": "Scheduled",
+        "address": "1600 Amphitheatre Parkway",
+        "city": "Mountain View",
+        "state": "CA",
+        "zip": "94043",
+        "patient_phone": "+14085550101",
+    }]
 
-# -----------------------------
-# Main
-# -----------------------------
+    # If Maps is ready, geocode addresses to lat/lon (best-effort)
+    if MAPS_READY:
+        for a in appts:
+            addr = f"{a['address']}, {a['city']}, {a['state']} {a['zip']}"
+            try:
+                url = "https://maps.googleapis.com/maps/api/geocode/json?" + urlencode({"address": addr, "key": GOOGLE_MAPS_API_KEY})
+                r = requests.get(url, timeout=10)
+                g = r.json()
+                if g.get("results"):
+                    loc = g["results"][0]["geometry"]["location"]
+                    a["lat"] = loc["lat"]; a["lon"] = loc["lng"]
+            except Exception:
+                pass
+
+    return jsonify({"appointments": appts, "status": "ok"})
+
+@app.route("/schedule/optimize", methods=["POST"])
+def schedule_optimize():
+    require_token()
+    data = request.get_json(force=True, silent=True) or {}
+    date = (data.get("date") or datetime.utcnow().date().isoformat()).strip()
+    therapist = (data.get("therapist") or "").strip()
+
+    # Minimal demo result. When Maps is ready, we pretend we computed drive time.
+    result = {
+        "date": date,
+        "therapist": therapist or "unknown",
+        "drive_time": bool(MAPS_READY),
+        "ok": True,
+    }
+    return jsonify(result)
+
+# ---------------------------------------------------------
+# Google Maps test endpoints (NEW)
+# ---------------------------------------------------------
+@app.route("/test/geocode", methods=["GET"])
+def test_geocode():
+    require_token()
+    if not MAPS_READY:
+        return jsonify({"error": "Google Maps not configured (missing key or requests)"}), 400
+
+    address = request.args.get("address", "").strip()
+    if not address:
+        return jsonify({"error": "missing address"}), 400
+
+    try:
+        url = "https://maps.googleapis.com/maps/api/geocode/json?" + urlencode({"address": address, "key": GOOGLE_MAPS_API_KEY})
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        if data.get("results"):
+            loc = data["results"][0]["geometry"]["location"]
+            return jsonify({"lat": loc["lat"], "lon": loc["lng"], "status": "ok"})
+        return jsonify({"status": "no_results", "raw": data}), 404
+    except Exception as e:
+        return jsonify({"error": "request_failed", "detail": str(e)}), 502
+
+@app.route("/test/distance", methods=["GET"])
+def test_distance():
+    require_token()
+    if not MAPS_READY:
+        return jsonify({"error": "Google Maps not configured (missing key or requests)"}), 400
+
+    origin = request.args.get("from", "").strip()
+    destination = request.args.get("to", "").strip()
+    if not origin or not destination:
+        return jsonify({"error": "missing parameters 'from' and/or 'to'"}), 400
+
+    try:
+        url = "https://maps.googleapis.com/maps/api/distancematrix/json?" + urlencode({
+            "origins": origin,
+            "destinations": destination,
+            "key": GOOGLE_MAPS_API_KEY
+        })
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        if data.get("rows") and data["rows"][0]["elements"]:
+            elem = data["rows"][0]["elements"][0]
+            if elem.get("status") == "OK":
+                return jsonify({
+                    "distance_km": round(elem["distance"]["value"] / 1000, 3),
+                    "duration_min": round(elem["duration"]["value"] / 60, 1),
+                    "status": "ok"
+                })
+        return jsonify({"status": "no_results", "raw": data}), 404
+    except Exception as e:
+        return jsonify({"error": "request_failed", "detail": str(e)}), 502
+
+# ---------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------
 if __name__ == "__main__":
-    # Local dev only
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
